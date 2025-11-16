@@ -1,0 +1,459 @@
+from flask import Flask, jsonify, render_template_string, request, send_from_directory
+import locale, os, time, threading, queue, json, socket
+from collections import deque
+import paho.mqtt.client as mqtt
+
+app = Flask(__name__)
+
+# ---------- Locale opcional ----------
+for loc in ('es_ES.UTF-8', 'es_MX.UTF-8'):
+    try:
+        locale.setlocale(locale.LC_TIME, loc); break
+    except:
+        pass
+
+# ---------- MQTT ----------
+BROKER_HOST = "broker.mqtt.cool"
+BROKER_PORT = 1883
+
+# Tópicos EXACTOS
+TOPIC_RASPY = "data/Raspy"                  # Raspberry (histórico/peek)
+TOPIC_SEM1  = "city/sem/sem-001/telemetry"  # ESP32 semáforo 1
+TOPIC_SEM2  = "city/sem/sem-002/telemetry"  # ESP32 semáforo 2
+
+# ---------- Buffers ----------
+HIST_MAX = 300
+mensajes = deque(maxlen=HIST_MAX)
+ultimo_por_topic = {t: None for t in [TOPIC_RASPY, TOPIC_SEM1, TOPIC_SEM2]}
+
+SERIES_MAX = 120
+def clip_0_100(x):
+    try:
+        return max(0, min(100, int(float(x))))
+    except:
+        return None
+
+# Estructura para calcular tasa de vehículos
+vehicle_state = {
+    "sem-001": {
+        "last_count": None,      # último contador recibido
+        "last_ts": None,         # timestamp del último dato
+        "rate_buffer": deque(maxlen=12),  # buffer para promedio (últimos 12 valores ~1 min)
+    },
+    "sem-002": {
+        "last_count": None,
+        "last_ts": None,
+        "rate_buffer": deque(maxlen=12),
+    },
+}
+
+series = {
+    "sem-001": {"labels": deque(maxlen=SERIES_MAX),
+                "mq_pct": deque(maxlen=SERIES_MAX),
+                "veh":    deque(maxlen=SERIES_MAX)},  # ahora contiene tasa promediada
+    "sem-002": {"labels": deque(maxlen=SERIES_MAX),
+                "mq_pct": deque(maxlen=SERIES_MAX),
+                "veh":    deque(maxlen=SERIES_MAX)},
+}
+
+# ---------- Cola / MQTT ----------
+in_q = queue.Queue(maxsize=1000)
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    client.subscribe([(TOPIC_RASPY, 0), (TOPIC_SEM1, 0), (TOPIC_SEM2, 0)])
+
+def on_message(client, userdata, msg):
+    payload = msg.payload.decode(errors="ignore")
+    t = time.time()
+    try:
+        in_q.put_nowait((msg.topic, payload, t))
+    except queue.Full:
+        try: in_q.get_nowait()
+        except: pass
+        in_q.put_nowait((msg.topic, payload, t))
+
+def _ipv4(host, port):
+    # Fuerza IPv4 (evita problemas de IPv6 en algunos hostings)
+    try:
+        for fam,_,_,_,sa in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+            return sa[0]
+    except Exception:
+        pass
+    return host
+
+def mqtt_loop():
+    cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    cli.on_connect = on_connect
+    cli.on_message = on_message
+    cli.reconnect_delay_set(min_delay=1, max_delay=30)
+    while True:
+        try:
+            host_v4 = _ipv4(BROKER_HOST, BROKER_PORT)
+            cli.connect(host_v4, BROKER_PORT, 60)
+            cli.loop_forever()
+        except Exception:
+            time.sleep(5)
+
+def calculate_vehicle_rate(node_id, current_count, current_ts):
+    """
+    Calcula la tasa de vehículos por minuto basándose en la diferencia del contador
+    y el tiempo transcurrido. Retorna el promedio móvil de las últimas tasas.
+    """
+    state = vehicle_state.get(node_id)
+    if not state:
+        return None
+    
+    # Primera lectura
+    if state["last_count"] is None or state["last_ts"] is None:
+        state["last_count"] = current_count
+        state["last_ts"] = current_ts
+        return None
+    
+    # Calcular diferencia
+    count_diff = current_count - state["last_count"]
+    time_diff = current_ts - state["last_ts"]
+    
+    # Evitar divisiones por cero o valores negativos
+    if time_diff <= 0 or count_diff < 0:
+        state["last_count"] = current_count
+        state["last_ts"] = current_ts
+        return None
+    
+    # Calcular tasa: (vehículos / segundos) * 60 = vehículos/min
+    rate_per_min = (count_diff / time_diff) * 60.0
+    
+    # Agregar al buffer
+    state["rate_buffer"].append(rate_per_min)
+    
+    # Actualizar estado
+    state["last_count"] = current_count
+    state["last_ts"] = current_ts
+    
+    # Calcular promedio móvil
+    if len(state["rate_buffer"]) > 0:
+        avg_rate = sum(state["rate_buffer"]) / len(state["rate_buffer"])
+        return round(avg_rate, 1)
+    
+    return None
+
+def bridge_worker():
+    while True:
+        topic, payload, t_epoch = in_q.get()
+        # AHORA: fecha + hora en los mensajes (YYYY-MM-DD HH:MM:SS)
+        marca = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t_epoch))
+
+        # histórico textual – SOLO lo recibido
+        mensajes.appendleft({"ts": marca, "topic": topic, "msg": payload})
+        if topic in ultimo_por_topic:
+            ultimo_por_topic[topic] = {"ts": marca, "msg": payload, "topic": topic}
+
+        # series SOLO para semáforos
+        if topic in (TOPIC_SEM1, TOPIC_SEM2):
+            try:
+                data = json.loads(payload)
+                node = data.get("node_id")
+                if node in series:
+                    mq  = data.get("mq_pct")
+                    veh_count = data.get("veh_count")  # contador acumulativo del ESP32
+                    
+                    # Calcular tasa de vehículos por minuto
+                    veh_rate = calculate_vehicle_rate(node, veh_count, t_epoch)
+                    
+                    # Guardar en series
+                    series[node]["labels"].append(marca)
+                    series[node]["mq_pct"].append(clip_0_100(mq))
+                    
+                    # Guardar la tasa calculada (puede ser None en primeras lecturas)
+                    if veh_rate is not None:
+                        series[node]["veh"].append(max(0, round(veh_rate)))
+                    else:
+                        series[node]["veh"].append(None)
+                        
+            except Exception:
+                pass
+
+# ---------- Hilos ----------
+threading.Thread(target=mqtt_loop,     daemon=True).start()
+threading.Thread(target=bridge_worker, daemon=True).start()
+
+# ---------- Static ----------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+@app.route("/styles.css")
+def styles():
+    return send_from_directory(BASE_DIR, "styles.css")
+
+@app.route("/imagen.png")
+def imagen():
+    return send_from_directory(BASE_DIR, "imagen.png")
+
+@app.route("/logotipo.png")
+def logotipo():
+    return send_from_directory(BASE_DIR, "logotipo.png")
+
+@app.route("/logotipo_mini.png")
+def logotipo_mini():
+    return send_from_directory(BASE_DIR, "logotipo_mini.png")
+
+# ---------- UI ----------
+@app.route("/")
+def index():
+    html = """<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AmpelIntelligence</title>
+<link rel="icon" type="image/png" href="/logotipo_mini.png">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="logo-section"><img src="/logotipo.png" class="logo-header" alt="AmpelIntelligence"></div>
+    <div class="status"><div class="dot"></div><div class="status-text">Sistema Activo</div></div>
+  </div>
+
+  <div class="info-grid">
+    <div class="info-card"><div class="info-label">Broker MQTT</div><div class="info-value">{{host}}</div></div>
+    <div class="info-card"><div class="info-label">ESP32 S1</div><div class="info-value">{{t1}}</div></div>
+    <div class="info-card"><div class="info-label">ESP32 S2</div><div class="info-value">{{t2}}</div></div>
+    <div class="info-card"><div class="info-label">Raspberry</div><div class="info-value">{{raspy}}</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Semáforo 1</div>
+    <div class="mini-values">
+      <span>Calidad del aire: <b id="s1_mq_val">—</b>%</span>
+      <span>Tráfico: <b id="s1_veh_val">—</b> autos/min</span>
+    </div>
+    <div class="chart-placeholder"><canvas id="chart-sem1-mq"></canvas></div>
+    <div class="chart-placeholder"><canvas id="chart-sem1-veh"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Semáforo 2</div>
+    <div class="mini-values">
+      <span>Calidad del aire: <b id="s2_mq_val">—</b>%</span>
+      <span>Tráfico: <b id="s2_veh_val">—</b> autos/min</span>
+    </div>
+    <div class="chart-placeholder"><canvas id="chart-sem2-mq"></canvas></div>
+    <div class="chart-placeholder"><canvas id="chart-sem2-veh"></canvas></div>
+  </div>
+
+  <div class="display">
+    <div class="display-header">
+      <div class="display-title">Monitoreo en tiempo real</div>
+      <div class="msg-count" id="count">0 mensajes</div>
+    </div>
+    <div class="btn-group">
+      <button onclick="toggleUpdate()">⏯ Histórico (iniciar / detener)</button>
+      <button class="btn-raspy"  onclick="leerUnaVez('{{raspy}}')">🟢 Leer Raspberry Pi</button>
+      <button class="btn-esp32" onclick="leerUnaVez('{{t1}}')">🟠 Leer Semáforo 1</button>
+      <button class="btn-esp32" onclick="leerUnaVez('{{t2}}')">🟠 Leer Semáforo 2</button>
+    </div>
+    <div id="resultado">⚠️ No se han recibido datos aún. Enciende sensores o usa los botones de lectura puntual.</div>
+  </div>
+</div>
+
+<script>
+let intervaloTexto=null;
+
+// === plugin "Sin datos" para Chart.js ===
+const noData={id:'noData',afterDraw(chart){
+  const d1=chart.data?.datasets?.[0]?.data||[];
+  const d2=chart.data?.datasets?.[1]?.data||[];
+  if((d1.filter(v=>v!=null).length + d2.filter(v=>v!=null).length)===0){
+    const {ctx,chartArea:{left,top,right,bottom}}=chart;
+    ctx.save();ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillStyle='rgba(229,231,235,0.7)';ctx.font='14px Rajdhani';
+    ctx.fillText('Sin datos',(left+right)/2,(top+bottom)/2);ctx.restore();
+  }
+}};
+
+// utilidades
+function last(arr){return (arr&&arr.length)?arr[arr.length-1]:null;}
+
+// Regresión lineal simple (Últimos K puntos)
+function forecastLinear(vals, horizon=6, K=10, cap100=false){
+  const y=[];
+  for(let i=vals.length-1;i>=0 && y.length<K;i--){
+    const v=vals[i]; if(Number.isFinite(v)) y.unshift(v);
+  }
+  if(y.length<3) return [];
+  const n=y.length; let sx=0,sy=0,sxy=0,sx2=0;
+  for(let i=0;i<n;i++){ sx+=i; sy+=y[i]; sxy+=i*y[i]; sx2+=i*i; }
+  const den = n*sx2 - sx*sx;
+  const m = den!==0 ? (n*sxy - sx*sy)/den : 0;
+  const b = (sy - m*sx)/n;
+  const preds=[];
+  for(let k=1;k<=horizon;k++){
+    let yhat = m*(n-1+k)+b;
+    if (cap100) yhat = Math.max(0, Math.min(100, yhat)); else yhat = Math.max(0, yhat);
+    preds.push(Math.round(yhat));
+  }
+  return preds;
+}
+
+// Construye datasets extendidos con predicción dorada
+function buildForecastSeries(labels, y, cap100){
+  const preds = forecastLinear(y, 6, 10, cap100);
+  const labelsExt = labels.concat(preds.map((_,i)=>`t+${i+1}`));
+  const yActualExt = y.concat(Array(preds.length).fill(null));
+  const yPred = new Array(Math.max(labels.length-1,0)).fill(null)
+               .concat(y.length? [y[y.length-1]]: [])
+               .concat(preds);
+  return {labelsExt, yActualExt, yPred};
+}
+
+// === Gráficas (real brillante + predicción dorada) ===
+function mkLine(ctx, titleText){
+  return new Chart(ctx,{
+    type:'line',
+    data:{labels:[],datasets:[
+      {
+        label:titleText,
+        data:[],
+        tension:.25,
+        borderWidth:3,
+        borderColor:'#7EF9FF',        // línea real (cian brillante)
+        pointRadius:2,
+        pointHoverRadius:3,
+        pointBackgroundColor:'#7EF9FF',
+        spanGaps:true
+      },
+      {
+        label:'Predicción',
+        data:[],
+        tension:.25,
+        borderWidth:3,
+        borderDash:[6,6],
+        pointRadius:0,
+        borderColor:'#FFD24D',        // dorado
+        spanGaps:true
+      }
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{title:{display:true,text:titleText},legend:{display:false}},
+      scales:{ y:{beginAtZero:true} }
+    },
+    plugins:[noData]
+  });
+}
+const c1_mq=mkLine(document.getElementById('chart-sem1-mq').getContext('2d'),'Calidad del aire (%)');
+const c1_veh=mkLine(document.getElementById('chart-sem1-veh').getContext('2d'),'Tráfico (autos/min)');
+const c2_mq=mkLine(document.getElementById('chart-sem2-mq').getContext('2d'),'Calidad del aire (%)');
+const c2_veh=mkLine(document.getElementById('chart-sem2-veh').getContext('2d'),'Tráfico (autos/min)');
+
+// Ajusta Y según real+predicción con 15% de margen
+function setYRange(chart){
+  const a = chart.data.datasets[0].data.filter(v=>Number.isFinite(v));
+  const p = chart.data.datasets[1].data.filter(v=>Number.isFinite(v));
+  if(!(a.length||p.length)) return;
+  const m = Math.max(...a.concat(p));
+  chart.options.scales.y.max = Math.ceil(m * 1.15);
+}
+
+async function actualizarGraficas(){
+  const r=await fetch('/api/series'); const s=await r.json();
+
+  if(s['sem-001']){
+    const L=s['sem-001'].labels||[];
+    // MQ%
+    let draft=buildForecastSeries(L, s['sem-001'].mq_pct||[], true);
+    c1_mq.data.labels=draft.labelsExt;
+    c1_mq.data.datasets[0].data=draft.yActualExt;
+    c1_mq.data.datasets[1].data=draft.yPred;
+    setYRange(c1_mq); c1_mq.update('none');
+    // Veh
+    draft=buildForecastSeries(L, s['sem-001'].veh||[], false);
+    c1_veh.data.labels=draft.labelsExt;
+    c1_veh.data.datasets[0].data=draft.yActualExt;
+    c1_veh.data.datasets[1].data=draft.yPred;
+    setYRange(c1_veh); c1_veh.update('none');
+
+    const v1_mq=last(s['sem-001'].mq_pct||[]), v1_veh=last(s['sem-001'].veh||[]);
+    document.getElementById('s1_mq_val').innerText  = Number.isFinite(v1_mq)? v1_mq : '—';
+    document.getElementById('s1_veh_val').innerText = Number.isFinite(v1_veh)? v1_veh : '—';
+  }
+  if(s['sem-002']){
+    const L=s['sem-002'].labels||[];
+    // MQ%
+    let draft=buildForecastSeries(L, s['sem-002'].mq_pct||[], true);
+    c2_mq.data.labels=draft.labelsExt;
+    c2_mq.data.datasets[0].data=draft.yActualExt;
+    c2_mq.data.datasets[1].data=draft.yPred;
+    setYRange(c2_mq); c2_mq.update('none');
+    // Veh
+    draft=buildForecastSeries(L, s['sem-002'].veh||[], false);
+    c2_veh.data.labels=draft.labelsExt;
+    c2_veh.data.datasets[0].data=draft.yActualExt;
+    c2_veh.data.datasets[1].data=draft.yPred;
+    setYRange(c2_veh); c2_veh.update('none');
+
+    const v2_mq=last(s['sem-002'].mq_pct||[]), v2_veh=last(s['sem-002'].veh||[]);
+    document.getElementById('s2_mq_val').innerText  = Number.isFinite(v2_mq)? v2_mq : '—';
+    document.getElementById('s2_veh_val').innerText = Number.isFinite(v2_veh)? v2_veh : '—';
+  }
+}
+actualizarGraficas(); setInterval(actualizarGraficas,3000);
+
+// Histórico de texto (ya incluye FECHA + HORA)
+async function obtenerMensajes(){
+  const r=await fetch('/api/mqtt'); const d=await r.json();
+  const lines=(d.mensajes||[]).map(m=>`<span class="timestamp">${m.ts}</span> — <span class="topic">${m.topic}</span>: ${m.msg}`);
+  document.getElementById('count').innerText=`${lines.length} mensajes`;
+  document.getElementById('resultado').innerHTML= lines.length ? lines.map(l=>`<div class="msg-line">${l}</div>`).join("") : "⚠️ No se han recibido datos aún. Enciende sensores o usa los botones de lectura puntual.";
+}
+function toggleUpdate(){
+  if(intervaloTexto){ clearInterval(intervaloTexto); intervaloTexto=null;
+    document.getElementById('resultado').innerHTML += "<div class='msg-line'>ℹ Histórico detenido</div>";
+  } else {
+    obtenerMensajes(); intervaloTexto=setInterval(obtenerMensajes,3000);
+  }
+}
+async function leerUnaVez(topic){
+  const r=await fetch('/api/peek?topic='+encodeURIComponent(topic)); const d=await r.json();
+  if(!d || Object.keys(d).length===0){
+    document.getElementById('resultado').innerHTML = "⚠️ No hay lecturas recientes para ese tópico.";
+    document.getElementById('count').innerText = '0 mensajes'; return;
+  }
+  document.getElementById('resultado').innerHTML = `<div class="msg-line"><span class="timestamp">${d.ts||''}</span> — <span class="topic">${d.topic||topic}</span>: ${d.msg}</div>`;
+  document.getElementById('count').innerText = '1 mensaje';
+}
+
+// Iniciar el histórico automáticamente al cargar la página
+toggleUpdate();
+</script>
+</body></html>"""
+    return render_template_string(
+        html,
+        host=f"{BROKER_HOST}:{BROKER_PORT}",
+        t1=TOPIC_SEM1, t2=TOPIC_SEM2, raspy=TOPIC_RASPY
+    )
+
+# ---------- APIs ----------
+@app.route("/api/mqtt")
+def api_mqtt():
+    return jsonify({"mensajes": list(mensajes)})
+
+@app.route("/api/peek")
+def api_peek():
+    t = request.args.get("topic")
+    if t:
+        it = ultimo_por_topic.get(t)
+        return jsonify(it or {})
+    return jsonify({})
+
+@app.route("/api/series")
+def api_series():
+    return jsonify({
+        "sem-001": {k: list(v) for k, v in series["sem-001"].items()},
+        "sem-002": {k: list(v) for k, v in series["sem-002"].items()},
+    })
+
+# ---------- Main ----------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
