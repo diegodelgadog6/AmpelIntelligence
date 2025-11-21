@@ -2,6 +2,7 @@ from flask import Flask, jsonify, render_template_string, request, send_from_dir
 import locale, os, time, threading, queue, json, socket
 from collections import deque
 import paho.mqtt.client as mqtt
+import mysql.connector as mysql
 
 app = Flask(__name__)
 
@@ -11,6 +12,52 @@ for loc in ('es_ES.UTF-8', 'es_MX.UTF-8'):
         locale.setlocale(locale.LC_TIME, loc); break
     except:
         pass
+    
+# ---------- MySQL (XAMPP) ----------
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "",
+    "database": "ampelintelligence"
+}
+
+def get_db():
+    return mysql.connect(**DB_CONFIG)
+
+def get_semaforo_id(node_id):
+    try:
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("SELECT ID_Semaforo FROM semaforo WHERE Node_ID = %s", (node_id,))
+        row = cur.fetchone()
+        cur.close()
+        con.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[DB ERROR] get_semaforo_id: {e}")
+        return None
+
+def guardar_medicion(node_id, mq_raw, mq_pct, dist_cm, veh_count):
+    try:
+        id_semaforo = get_semaforo_id(node_id)
+        if id_semaforo is None:
+            print(f"[DB WARNING] Semáforo '{node_id}' no encontrado en BD")
+            return False
+        
+        con = get_db()
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO medicion (ID_Semaforo, MQ_Raw, MQ_Pct, Dist_CM, Veh_Count)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (id_semaforo, mq_raw, mq_pct, dist_cm, veh_count))
+        con.commit()
+        cur.close()
+        con.close()
+        print(f"[DB OK] Guardado: {node_id} → MQ:{mq_pct}% Dist:{dist_cm}cm Veh:{veh_count}")
+        return True
+    except Exception as e:
+        print(f"[DB ERROR] guardar_medicion: {e}")
+        return False    
 
 # ---------- MQTT ----------
 BROKER_HOST = "broker.mqtt.cool"
@@ -152,6 +199,16 @@ def bridge_worker():
             try:
                 data = json.loads(payload)
                 node = data.get("node_id")
+
+                # Extraer datos
+                mq_raw = data.get("mq_raw")
+                mq_pct = data.get("mq_pct")
+                dist_cm = data.get("dist_cm")
+                veh_count = data.get("veh_count")
+                
+                # ⭐ GUARDAR EN BASE DE DATOS
+                guardar_medicion(node, mq_raw, mq_pct, dist_cm, veh_count)
+
                 if node in series:
                     mq  = data.get("mq_pct")
                     veh_count = data.get("veh_count")  # contador acumulativo del ESP32
