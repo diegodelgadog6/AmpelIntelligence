@@ -199,6 +199,16 @@ def bridge_worker():
             try:
                 data = json.loads(payload)
                 node = data.get("node_id")
+
+                # Extraer datos
+                mq_raw = data.get("mq_raw")
+                mq_pct = data.get("mq_pct")
+                dist_cm = data.get("dist_cm")
+                veh_count = data.get("veh_count")
+                
+                # ⭐ GUARDAR EN BASE DE DATOS
+                guardar_medicion(node, mq_raw, mq_pct, dist_cm, veh_count)
+
                 if node in series:
                     mq  = data.get("mq_pct")
                     veh_count = data.get("veh_count")  # contador acumulativo del ESP32
