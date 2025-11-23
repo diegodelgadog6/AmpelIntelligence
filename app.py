@@ -79,17 +79,16 @@ def clip_0_100(x):
     except:
         return None
 
-# Estructura para calcular tasa de vehículos
+# Estructura para calcular autos/minuto correctamente
+# Guardamos ventana de 60 segundos de datos
 vehicle_state = {
     "sem-001": {
         "last_count": None,
-        "last_ts": None,
-        "rate_buffer": deque(maxlen=12),
+        "window": deque(maxlen=100),  # últimos datos (timestamp, count)
     },
     "sem-002": {
         "last_count": None,
-        "last_ts": None,
-        "rate_buffer": deque(maxlen=12),
+        "window": deque(maxlen=100),
     },
 }
 
@@ -140,34 +139,50 @@ def mqtt_loop():
         except Exception:
             time.sleep(5)
 
-def calculate_vehicle_rate(node_id, current_count, current_ts):
+def calculate_vehicles_per_minute(node_id, current_count, current_ts):
+    """
+    Calcula autos/minuto correctamente:
+    - Detecta resets del contador
+    - Suma todos los incrementos en los últimos 60 segundos
+    - Retorna el total de autos que pasaron en el último minuto
+    """
     state = vehicle_state.get(node_id)
     if not state:
         return None
     
-    if state["last_count"] is None or state["last_ts"] is None:
-        state["last_count"] = current_count
-        state["last_ts"] = current_ts
+    # Agregar dato actual a la ventana
+    state["window"].append((current_ts, current_count))
+    
+    # Limpiar datos viejos (>60 segundos)
+    now = current_ts
+    while state["window"] and (now - state["window"][0][0] > 60):
+        state["window"].popleft()
+    
+    # Necesitamos al menos 2 datos para calcular
+    if len(state["window"]) < 2:
         return None
     
-    count_diff = current_count - state["last_count"]
-    time_diff = current_ts - state["last_ts"]
+    # Sumar todos los incrementos detectando resets
+    total_vehicles = 0
+    prev_count = state["window"][0][1]
     
-    if time_diff <= 0 or count_diff < 0:
-        state["last_count"] = current_count
-        state["last_ts"] = current_ts
-        return None
+    for i in range(1, len(state["window"])):
+        ts, count = state["window"][i]
+        
+        # Si el contador bajó, hubo un reset
+        if count < prev_count:
+            # El valor anterior era el máximo antes del reset
+            total_vehicles += prev_count
+            # Ahora empezamos desde el nuevo valor
+            total_vehicles += count
+        else:
+            # Contador aumentó normalmente
+            increment = count - prev_count
+            total_vehicles += increment
+        
+        prev_count = count
     
-    rate_per_min = (count_diff / time_diff) * 60.0
-    state["rate_buffer"].append(rate_per_min)
-    state["last_count"] = current_count
-    state["last_ts"] = current_ts
-    
-    if len(state["rate_buffer"]) > 0:
-        avg_rate = sum(state["rate_buffer"]) / len(state["rate_buffer"])
-        return round(avg_rate, 1)
-    
-    return None
+    return total_vehicles
 
 def bridge_worker():
     while True:
@@ -194,13 +209,15 @@ def bridge_worker():
                 guardar_medicion(node, mq_raw, mq_pct, dist_cm, veh_count)
 
                 if node in series:
-                    veh_rate = calculate_vehicle_rate(node, veh_count, t_epoch)
+                    # Calcular autos/minuto correctamente
+                    veh_per_min = calculate_vehicles_per_minute(node, veh_count, t_epoch)
                     
                     series[node]["labels"].append(marca)
                     series[node]["mq_pct"].append(clip_0_100(mq_pct))
                     
-                    if veh_rate is not None:
-                        series[node]["veh"].append(max(0, round(veh_rate)))
+                    if veh_per_min is not None:
+                        series[node]["veh"].append(max(0, veh_per_min))
+                        print(f"[CALC] {node} → {veh_per_min} autos en último minuto")
                     else:
                         series[node]["veh"].append(None)
                         
