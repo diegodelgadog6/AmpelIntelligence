@@ -13,7 +13,7 @@ for loc in ('es_ES.UTF-8', 'es_MX.UTF-8'):
     except:
         pass
     
-# ---------- MySQL ----------
+# ---------- MySQL (XAMPP) ----------
 DB_CONFIG = {
     "host": "localhost",
     "user": "root",
@@ -63,14 +63,15 @@ def guardar_medicion(node_id, mq_raw, mq_pct, dist_cm, veh_count):
 BROKER_HOST = "broker.mqtt.cool"
 BROKER_PORT = 1883
 
-# Tópicos ESP32
-TOPIC_SEM1  = "city/sem/sem-001/telemetry"
-TOPIC_SEM2  = "city/sem/sem-002/telemetry"
+# Tópicos EXACTOS
+TOPIC_RASPY = "data/Raspy"                  # Raspberry (histórico/peek)
+TOPIC_SEM1  = "city/sem/sem-001/telemetry"  # ESP32 semáforo 1
+TOPIC_SEM2  = "city/sem/sem-002/telemetry"  # ESP32 semáforo 2
 
 # ---------- Buffers ----------
 HIST_MAX = 300
 mensajes = deque(maxlen=HIST_MAX)
-ultimo_por_topic = {t: None for t in [TOPIC_SEM1, TOPIC_SEM2]}
+ultimo_por_topic = {t: None for t in [TOPIC_RASPY, TOPIC_SEM1, TOPIC_SEM2]}
 
 SERIES_MAX = 120
 def clip_0_100(x):
@@ -79,23 +80,24 @@ def clip_0_100(x):
     except:
         return None
 
-# Estructura para calcular autos/minuto correctamente
-# Guardamos ventana de 60 segundos de datos
+# Estructura para calcular tasa de vehículos
 vehicle_state = {
     "sem-001": {
-        "last_count": None,
-        "window": deque(maxlen=100),  # últimos datos (timestamp, count)
+        "last_count": None,      # último contador recibido
+        "last_ts": None,         # timestamp del último dato
+        "rate_buffer": deque(maxlen=12),  # buffer para promedio (últimos 12 valores ~1 min)
     },
     "sem-002": {
         "last_count": None,
-        "window": deque(maxlen=100),
+        "last_ts": None,
+        "rate_buffer": deque(maxlen=12),
     },
 }
 
 series = {
     "sem-001": {"labels": deque(maxlen=SERIES_MAX),
                 "mq_pct": deque(maxlen=SERIES_MAX),
-                "veh":    deque(maxlen=SERIES_MAX)},
+                "veh":    deque(maxlen=SERIES_MAX)},  # ahora contiene tasa promediada
     "sem-002": {"labels": deque(maxlen=SERIES_MAX),
                 "mq_pct": deque(maxlen=SERIES_MAX),
                 "veh":    deque(maxlen=SERIES_MAX)},
@@ -105,8 +107,7 @@ series = {
 in_q = queue.Queue(maxsize=1000)
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    client.subscribe([(TOPIC_SEM1, 0), (TOPIC_SEM2, 0)])
-    print("[MQTT] Conectado y suscrito a semáforos")
+    client.subscribe([(TOPIC_RASPY, 0), (TOPIC_SEM1, 0), (TOPIC_SEM2, 0)])
 
 def on_message(client, userdata, msg):
     payload = msg.payload.decode(errors="ignore")
@@ -119,6 +120,7 @@ def on_message(client, userdata, msg):
         in_q.put_nowait((msg.topic, payload, t))
 
 def _ipv4(host, port):
+    # Fuerza IPv4 (evita problemas de IPv6 en algunos hostings)
     try:
         for fam,_,_,_,sa in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
             return sa[0]
@@ -139,90 +141,93 @@ def mqtt_loop():
         except Exception:
             time.sleep(5)
 
-def calculate_vehicles_per_minute(node_id, current_count, current_ts):
+def calculate_vehicle_rate(node_id, current_count, current_ts):
     """
-    Calcula autos/minuto correctamente:
-    - Detecta resets del contador
-    - Suma todos los incrementos en los últimos 60 segundos
-    - Retorna el total de autos que pasaron en el último minuto
+    Calcula la tasa de vehículos por minuto basándose en la diferencia del contador
+    y el tiempo transcurrido. Retorna el promedio móvil de las últimas tasas.
     """
     state = vehicle_state.get(node_id)
     if not state:
         return None
     
-    # Agregar dato actual a la ventana
-    state["window"].append((current_ts, current_count))
-    
-    # Limpiar datos viejos (>60 segundos)
-    now = current_ts
-    while state["window"] and (now - state["window"][0][0] > 60):
-        state["window"].popleft()
-    
-    # Necesitamos al menos 2 datos para calcular
-    if len(state["window"]) < 2:
+    # Primera lectura
+    if state["last_count"] is None or state["last_ts"] is None:
+        state["last_count"] = current_count
+        state["last_ts"] = current_ts
         return None
     
-    # Sumar todos los incrementos detectando resets
-    total_vehicles = 0
-    prev_count = state["window"][0][1]
+    # Calcular diferencia
+    count_diff = current_count - state["last_count"]
+    time_diff = current_ts - state["last_ts"]
     
-    for i in range(1, len(state["window"])):
-        ts, count = state["window"][i]
-        
-        # Si el contador bajó, hubo un reset
-        if count < prev_count:
-            # El valor anterior era el máximo antes del reset
-            total_vehicles += prev_count
-            # Ahora empezamos desde el nuevo valor
-            total_vehicles += count
-        else:
-            # Contador aumentó normalmente
-            increment = count - prev_count
-            total_vehicles += increment
-        
-        prev_count = count
+    # Evitar divisiones por cero o valores negativos
+    if time_diff <= 0 or count_diff < 0:
+        state["last_count"] = current_count
+        state["last_ts"] = current_ts
+        return None
     
-    return total_vehicles
+    # Calcular tasa: (vehículos / segundos) * 60 = vehículos/min
+    rate_per_min = (count_diff / time_diff) * 60.0
+    
+    # Agregar al buffer
+    state["rate_buffer"].append(rate_per_min)
+    
+    # Actualizar estado
+    state["last_count"] = current_count
+    state["last_ts"] = current_ts
+    
+    # Calcular promedio móvil
+    if len(state["rate_buffer"]) > 0:
+        avg_rate = sum(state["rate_buffer"]) / len(state["rate_buffer"])
+        return round(avg_rate, 1)
+    
+    return None
 
 def bridge_worker():
     while True:
         topic, payload, t_epoch = in_q.get()
+        # AHORA: fecha + hora en los mensajes (YYYY-MM-DD HH:MM:SS)
         marca = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t_epoch))
 
-        # histórico textual
+        # histórico textual – SOLO lo recibido
         mensajes.appendleft({"ts": marca, "topic": topic, "msg": payload})
         if topic in ultimo_por_topic:
             ultimo_por_topic[topic] = {"ts": marca, "msg": payload, "topic": topic}
 
-        # Procesar datos de semáforos
+        # series SOLO para semáforos
         if topic in (TOPIC_SEM1, TOPIC_SEM2):
             try:
                 data = json.loads(payload)
                 node = data.get("node_id")
 
+                # Extraer datos
                 mq_raw = data.get("mq_raw")
                 mq_pct = data.get("mq_pct")
                 dist_cm = data.get("dist_cm")
                 veh_count = data.get("veh_count")
                 
-                # GUARDAR EN BASE DE DATOS
+                # ⭐ GUARDAR EN BASE DE DATOS
                 guardar_medicion(node, mq_raw, mq_pct, dist_cm, veh_count)
 
                 if node in series:
-                    # Calcular autos/minuto correctamente
-                    veh_per_min = calculate_vehicles_per_minute(node, veh_count, t_epoch)
+                    mq  = data.get("mq_pct")
+                    veh_count = data.get("veh_count")  # contador acumulativo del ESP32
                     
+                    # Calcular tasa de vehículos por minuto
+                    veh_rate = calculate_vehicle_rate(node, veh_count, t_epoch)
+                    
+                    # Guardar en series
                     series[node]["labels"].append(marca)
-                    series[node]["mq_pct"].append(clip_0_100(mq_pct))
+                    series[node]["mq_pct"].append(clip_0_100(mq))
                     
-                    if veh_per_min is not None:
-                        series[node]["veh"].append(max(0, veh_per_min))
-                        print(f"[CALC] {node} → {veh_per_min} autos en último minuto")
+                    # Guardar la tasa calculada (puede ser None en primeras lecturas)
+                    if veh_rate is not None:
+                        series[node]["veh"].append(max(0, round(veh_rate)))
                     else:
                         series[node]["veh"].append(None)
                         
-            except Exception as e:
-                print(f"[ERROR] Procesando mensaje: {e}")
+            except Exception:
+                pass
 
 # ---------- Hilos ----------
 threading.Thread(target=mqtt_loop,     daemon=True).start()
@@ -266,6 +271,13 @@ def index():
     <div class="status"><div class="dot"></div><div class="status-text">Sistema Activo</div></div>
   </div>
 
+  <div class="info-grid">
+    <div class="info-card"><div class="info-label">Broker MQTT</div><div class="info-value">{{host}}</div></div>
+    <div class="info-card"><div class="info-label">ESP32 S1</div><div class="info-value">{{t1}}</div></div>
+    <div class="info-card"><div class="info-label">ESP32 S2</div><div class="info-value">{{t2}}</div></div>
+    <div class="info-card"><div class="info-label">Raspberry</div><div class="info-value">{{raspy}}</div></div>
+  </div>
+
   <div class="panel">
     <div class="panel-title">Semáforo 1</div>
     <div class="mini-values">
@@ -293,6 +305,7 @@ def index():
     </div>
     <div class="btn-group">
       <button onclick="toggleUpdate()">⏯ Histórico (iniciar / detener)</button>
+      <button class="btn-raspy"  onclick="leerUnaVez('{{raspy}}')">🟢 Leer Raspberry Pi</button>
       <button class="btn-esp32" onclick="leerUnaVez('{{t1}}')">🟠 Leer Semáforo 1</button>
       <button class="btn-esp32" onclick="leerUnaVez('{{t2}}')">🟠 Leer Semáforo 2</button>
     </div>
@@ -303,6 +316,7 @@ def index():
 <script>
 let intervaloTexto=null;
 
+// === plugin "Sin datos" para Chart.js ===
 const noData={id:'noData',afterDraw(chart){
   const d1=chart.data?.datasets?.[0]?.data||[];
   const d2=chart.data?.datasets?.[1]?.data||[];
@@ -314,8 +328,10 @@ const noData={id:'noData',afterDraw(chart){
   }
 }};
 
+// utilidades
 function last(arr){return (arr&&arr.length)?arr[arr.length-1]:null;}
 
+// Regresión lineal simple (Últimos K puntos)
 function forecastLinear(vals, horizon=6, K=10, cap100=false){
   const y=[];
   for(let i=vals.length-1;i>=0 && y.length<K;i--){
@@ -336,6 +352,7 @@ function forecastLinear(vals, horizon=6, K=10, cap100=false){
   return preds;
 }
 
+// Construye datasets extendidos con predicción dorada
 function buildForecastSeries(labels, y, cap100){
   const preds = forecastLinear(y, 6, 10, cap100);
   const labelsExt = labels.concat(preds.map((_,i)=>`t+${i+1}`));
@@ -346,6 +363,7 @@ function buildForecastSeries(labels, y, cap100){
   return {labelsExt, yActualExt, yPred};
 }
 
+// === Gráficas (real brillante + predicción dorada) ===
 function mkLine(ctx, titleText){
   return new Chart(ctx,{
     type:'line',
@@ -355,7 +373,7 @@ function mkLine(ctx, titleText){
         data:[],
         tension:.25,
         borderWidth:3,
-        borderColor:'#7EF9FF',
+        borderColor:'#7EF9FF',        // línea real (cian brillante)
         pointRadius:2,
         pointHoverRadius:3,
         pointBackgroundColor:'#7EF9FF',
@@ -368,7 +386,7 @@ function mkLine(ctx, titleText){
         borderWidth:3,
         borderDash:[6,6],
         pointRadius:0,
-        borderColor:'#FFD24D',
+        borderColor:'#FFD24D',        // dorado
         spanGaps:true
       }
     ]},
@@ -380,12 +398,12 @@ function mkLine(ctx, titleText){
     plugins:[noData]
   });
 }
-
 const c1_mq=mkLine(document.getElementById('chart-sem1-mq').getContext('2d'),'Calidad del aire (%)');
 const c1_veh=mkLine(document.getElementById('chart-sem1-veh').getContext('2d'),'Tráfico (autos/min)');
 const c2_mq=mkLine(document.getElementById('chart-sem2-mq').getContext('2d'),'Calidad del aire (%)');
 const c2_veh=mkLine(document.getElementById('chart-sem2-veh').getContext('2d'),'Tráfico (autos/min)');
 
+// Ajusta Y según real+predicción con 15% de margen
 function setYRange(chart){
   const a = chart.data.datasets[0].data.filter(v=>Number.isFinite(v));
   const p = chart.data.datasets[1].data.filter(v=>Number.isFinite(v));
@@ -399,12 +417,13 @@ async function actualizarGraficas(){
 
   if(s['sem-001']){
     const L=s['sem-001'].labels||[];
+    // MQ%
     let draft=buildForecastSeries(L, s['sem-001'].mq_pct||[], true);
     c1_mq.data.labels=draft.labelsExt;
     c1_mq.data.datasets[0].data=draft.yActualExt;
     c1_mq.data.datasets[1].data=draft.yPred;
     setYRange(c1_mq); c1_mq.update('none');
-
+    // Veh
     draft=buildForecastSeries(L, s['sem-001'].veh||[], false);
     c1_veh.data.labels=draft.labelsExt;
     c1_veh.data.datasets[0].data=draft.yActualExt;
@@ -417,12 +436,13 @@ async function actualizarGraficas(){
   }
   if(s['sem-002']){
     const L=s['sem-002'].labels||[];
+    // MQ%
     let draft=buildForecastSeries(L, s['sem-002'].mq_pct||[], true);
     c2_mq.data.labels=draft.labelsExt;
     c2_mq.data.datasets[0].data=draft.yActualExt;
     c2_mq.data.datasets[1].data=draft.yPred;
     setYRange(c2_mq); c2_mq.update('none');
-
+    // Veh
     draft=buildForecastSeries(L, s['sem-002'].veh||[], false);
     c2_veh.data.labels=draft.labelsExt;
     c2_veh.data.datasets[0].data=draft.yActualExt;
@@ -436,13 +456,13 @@ async function actualizarGraficas(){
 }
 actualizarGraficas(); setInterval(actualizarGraficas,3000);
 
+// Histórico de texto (ya incluye FECHA + HORA)
 async function obtenerMensajes(){
   const r=await fetch('/api/mqtt'); const d=await r.json();
   const lines=(d.mensajes||[]).map(m=>`<span class="timestamp">${m.ts}</span> — <span class="topic">${m.topic}</span>: ${m.msg}`);
   document.getElementById('count').innerText=`${lines.length} mensajes`;
   document.getElementById('resultado').innerHTML= lines.length ? lines.map(l=>`<div class="msg-line">${l}</div>`).join("") : "⚠️ No se han recibido datos aún. Enciende sensores o usa los botones de lectura puntual.";
 }
-
 function toggleUpdate(){
   if(intervaloTexto){ clearInterval(intervaloTexto); intervaloTexto=null;
     document.getElementById('resultado').innerHTML += "<div class='msg-line'>ℹ Histórico detenido</div>";
@@ -450,7 +470,6 @@ function toggleUpdate(){
     obtenerMensajes(); intervaloTexto=setInterval(obtenerMensajes,3000);
   }
 }
-
 async function leerUnaVez(topic){
   const r=await fetch('/api/peek?topic='+encodeURIComponent(topic)); const d=await r.json();
   if(!d || Object.keys(d).length===0){
@@ -461,12 +480,14 @@ async function leerUnaVez(topic){
   document.getElementById('count').innerText = '1 mensaje';
 }
 
+// Iniciar el histórico automáticamente al cargar la página
 toggleUpdate();
 </script>
 </body></html>"""
     return render_template_string(
         html,
-        t1=TOPIC_SEM1, t2=TOPIC_SEM2
+        host=f"{BROKER_HOST}:{BROKER_PORT}",
+        t1=TOPIC_SEM1, t2=TOPIC_SEM2, raspy=TOPIC_RASPY
     )
 
 # ---------- APIs ----------
