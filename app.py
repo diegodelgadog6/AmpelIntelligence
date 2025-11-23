@@ -1,10 +1,11 @@
-from flask import Flask, jsonify, render_template_string, request, send_from_directory
+from flask import Flask, jsonify, render_template_string, request, send_from_directory, redirect, url_for, session
 import locale, os, time, threading, queue, json, socket
 from collections import deque
 import paho.mqtt.client as mqtt
 import mysql.connector as mysql
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'cambia-esta-clave-super-secreta')
 
 # ---------- Locale opcional ----------
 for loc in ('es_ES.UTF-8', 'es_MX.UTF-8'):
@@ -194,10 +195,13 @@ def bridge_worker():
                 guardar_medicion(node, mq_raw, mq_pct, dist_cm, veh_count)
 
                 if node in series:
+                    mq  = data.get("mq_pct")
+                    veh_count = data.get("veh_count")
+                    
                     veh_rate = calculate_vehicle_rate(node, veh_count, t_epoch)
                     
                     series[node]["labels"].append(marca)
-                    series[node]["mq_pct"].append(clip_0_100(mq_pct))
+                    series[node]["mq_pct"].append(clip_0_100(mq))
                     
                     if veh_rate is not None:
                         series[node]["veh"].append(max(0, round(veh_rate)))
@@ -238,7 +242,7 @@ def index():
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>AmpelIntelligence</title>
 <link rel="icon" type="image/png" href="/logotipo_mini.png">
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family:Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/styles.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
 </head>
@@ -247,6 +251,15 @@ def index():
   <div class="header">
     <div class="logo-section"><img src="/logotipo.png" class="logo-header" alt="AmpelIntelligence"></div>
     <div class="status"><div class="dot"></div><div class="status-text">Sistema Activo</div></div>
+    <div class="header-right">
+      {% if is_admin %}
+        <span class="admin-badge">Admin: {{ admin_name }}</span>
+        <a href="{{ url_for('admin_panel') }}" class="admin-link">Panel</a>
+        <a href="{{ url_for('logout') }}" class="admin-link">Salir</a>
+      {% else %}
+        <a href="{{ url_for('login') }}" class="admin-link">Acceso administrador</a>
+      {% endif %}
+    </div>
   </div>
 
   <div class="panel">
@@ -449,8 +462,245 @@ toggleUpdate();
 </body></html>"""
     return render_template_string(
         html,
-        t1=TOPIC_SEM1, t2=TOPIC_SEM2
+        t1=TOPIC_SEM1,
+        t2=TOPIC_SEM2,
+        is_admin=bool(session.get("admin_id")),
+        admin_name=session.get("admin_name")
     )
+
+# ---------- Autenticación administrador ----------
+
+def autenticar_admin(email, password):
+    try:
+        con = get_db()
+        cur = con.cursor()
+        cur.execute(
+            "SELECT ID_Admin, Nombre FROM administrador WHERE Email = %s AND Password = %s LIMIT 1",
+            (email, password),
+        )
+        row = cur.fetchone()
+        cur.close()
+        con.close()
+        if row:
+            return {"id": row[0], "nombre": row[1]}
+        return None
+    except Exception as e:
+        print(f"[DB ERROR] autenticar_admin: {e}")
+        return None
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "").strip()
+        admin = autenticar_admin(email, password)
+        if admin:
+            session["admin_id"] = admin["id"]
+            session["admin_name"] = admin["nombre"]
+            return redirect(url_for("admin_panel"))
+        else:
+            error = "Correo o contraseña incorrectos."
+
+    html = """<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Login administrador - AmpelIntelligence</title>
+<link rel="icon" type="image/png" href="/logotipo_mini.png">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="logo-section"><img src="/logotipo.png" class="logo-header" alt="AmpelIntelligence"></div>
+    <div class="status"><div class="dot"></div><div class="status-text">Acceso administrador</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Iniciar sesión</div>
+    <form method="post" class="admin-form">
+      <label>Email</label>
+      <input type="email" name="email" required>
+      <label>Contraseña</label>
+      <input type="password" name="password" required>
+      {% if error %}
+      <div class="admin-error">{{ error }}</div>
+      {% endif %}
+      <div class="btn-group">
+        <button type="submit">Entrar</button>
+        <button type="button" onclick="window.location.href='{{ url_for('index') }}'">Volver al visor</button>
+      </div>
+    </form>
+  </div>
+</div>
+</body></html>"""
+    return render_template_string(html, error=error)
+
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin_panel():
+    if not session.get("admin_id"):
+        return redirect(url_for("login"))
+
+    stats = {
+        "semaforos": 0,
+        "mediciones": 0,
+        "sensores": 0,
+        "actuadores": 0,
+        "ultima_lectura": None,
+    }
+    sql_result = None
+    sql_columns = None
+    sql_message = None
+    sql_error = None
+
+    try:
+        con = get_db()
+        cur = con.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM semaforo")
+        stats["semaforos"] = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM medicion")
+        stats["mediciones"] = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM sensor")
+        stats["sensores"] = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT COUNT(*) FROM actuador")
+        stats["actuadores"] = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT MAX(Fecha_Hora) FROM medicion")
+        row = cur.fetchone()
+        stats["ultima_lectura"] = row[0] if row and row[0] is not None else None
+
+        if request.method == "POST":
+            sql = request.form.get("sql", "").strip()
+            if sql:
+                try:
+                    cur2 = con.cursor()
+                    cur2.execute(sql)
+                    first_word = sql.split()[0].upper()
+                    if first_word == "SELECT" or first_word.startswith("SHOW") or first_word.startswith("DESCRIBE"):
+                        sql_columns = cur2.column_names
+                        sql_result = cur2.fetchall()
+                        sql_message = f"{len(sql_result)} filas devueltas."
+                    else:
+                        con.commit()
+                        sql_message = "Comando ejecutado correctamente."
+                    cur2.close()
+                except Exception as e:
+                    sql_error = str(e)
+        cur.close()
+        con.close()
+    except Exception as e:
+        sql_error = f"Error de conexión a la base de datos: {e}"
+
+    html = """<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Panel administrador - AmpelIntelligence</title>
+<link rel="icon" type="image/png" href="/logotipo_mini.png">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="logo-section"><img src="/logotipo.png" class="logo-header" alt="AmpelIntelligence"></div>
+    <div class="status"><div class="dot"></div><div class="status-text">Panel administrador</div></div>
+    <div class="header-right">
+      <span class="admin-badge">Admin: {{ admin_name }}</span>
+      <a href="{{ url_for('index') }}" class="admin-link">Visor</a>
+      <a href="{{ url_for('logout') }}" class="admin-link">Salir</a>
+    </div>
+  </div>
+
+  <div class="info-grid">
+    <div class="info-card">
+      <div class="info-label">Semáforos registrados</div>
+      <div class="info-value">{{ stats.semaforos }}</div>
+    </div>
+    <div class="info-card">
+      <div class="info-label">Total de mediciones</div>
+      <div class="info-value">{{ stats.mediciones }}</div>
+    </div>
+    <div class="info-card">
+      <div class="info-label">Sensores</div>
+      <div class="info-value">{{ stats.sensores }}</div>
+    </div>
+    <div class="info-card">
+      <div class="info-label">Actuadores</div>
+      <div class="info-value">{{ stats.actuadores }}</div>
+    </div>
+    <div class="info-card">
+      <div class="info-label">Última lectura</div>
+      <div class="info-value">{{ stats.ultima_lectura or '—' }}</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Gestión de base de datos</div>
+    <p style="font-size:13px;color:var(--secondary);margin-bottom:10px">
+      Ejecuta consultas SQL directamente sobre la base de datos <b>ampelintelligence</b>. Úsalo con cuidado.
+    </p>
+    <form method="post" class="admin-form">
+      <textarea name="sql" rows="5" placeholder="Escribe aquí tu sentencia SQL (SELECT, INSERT, UPDATE, DELETE, ...)" required>{{ request.form.sql or '' }}</textarea>
+      <div class="btn-group">
+        <button type="submit">Ejecutar SQL</button>
+        <button type="button" onclick="window.open('http://localhost/phpmyadmin/index.php?db=ampelintelligence','_blank')">Abrir phpMyAdmin</button>
+      </div>
+    </form>
+    {% if sql_error %}
+    <div class="admin-error">{{ sql_error }}</div>
+    {% endif %}
+    {% if sql_message %}
+    <div class="admin-ok">{{ sql_message }}</div>
+    {% endif %}
+
+    {% if sql_result %}
+    <div class="sql-result">
+      <table class="sql-table">
+        <thead>
+          <tr>
+            {% for col in sql_columns %}
+            <th>{{ col }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in sql_result %}
+          <tr>
+            {% for cell in row %}
+            <td>{{ cell }}</td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</div>
+</body></html>"""
+    return render_template_string(
+        html,
+        stats=stats,
+        sql_result=sql_result,
+        sql_columns=sql_columns,
+        sql_message=sql_message,
+        sql_error=sql_error,
+        admin_name=session.get("admin_name"),
+        request=request,
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
 
 # ---------- APIs ----------
 @app.route("/api/mqtt")
