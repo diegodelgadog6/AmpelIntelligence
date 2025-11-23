@@ -194,13 +194,10 @@ def bridge_worker():
                 guardar_medicion(node, mq_raw, mq_pct, dist_cm, veh_count)
 
                 if node in series:
-                    mq  = data.get("mq_pct")
-                    veh_count = data.get("veh_count")
-                    
                     veh_rate = calculate_vehicle_rate(node, veh_count, t_epoch)
                     
                     series[node]["labels"].append(marca)
-                    series[node]["mq_pct"].append(clip_0_100(mq))
+                    series[node]["mq_pct"].append(clip_0_100(mq_pct))
                     
                     if veh_rate is not None:
                         series[node]["veh"].append(max(0, round(veh_rate)))
@@ -241,7 +238,7 @@ def index():
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>AmpelIntelligence</title>
 <link rel="icon" type="image/png" href="/logotipo_mini.png">
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family:Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/styles.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
 </head>
